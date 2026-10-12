@@ -481,9 +481,19 @@ def fetch_private_access_token(client: TLSClient, shop_url: str, checkout_url: s
 
 # ──────────────────────── Step 3: actions JS ─────────────────────────
 
-def extract_actions_js_url(checkout_html: str, shop_url: str) -> str:
-    match = re.search(r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)', checkout_html)
-    return shop_url + match.group(1) if match else ""
+def extract_all_checkout_js_urls(checkout_html: str, shop_url: str) -> List[str]:
+    if not checkout_html:
+        return []
+    matches = re.findall(
+        r'(/cdn/shopifycloud/checkout-web/assets/[A-Za-z0-9_\-/]+\.[A-Za-z0-9_\-]+\.js)',
+        checkout_html
+    )
+    seen, urls = set(), []
+    for m in matches:
+        if m not in seen:
+            seen.add(m)
+            urls.append(shop_url + m)
+    return urls
 
 def fetch_actions_js(client: TLSClient, actions_url: str, shop_url: str) -> str:
     headers = {
@@ -1588,16 +1598,46 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             return result
 
         try:
-            actions_url = extract_actions_js_url(checkout_html, shop_url)
-            if not actions_url:
-                raise Exception("could not find actions JS URL")
-            js_body     = fetch_actions_js(client, actions_url, shop_url)
-            proposal_id = extract_proposal_id(js_body)
-            submit_id   = extract_submit_for_completion_id(js_body)
+            js_urls = extract_all_checkout_js_urls(checkout_html, shop_url)
+            if not js_urls:
+                old_action = extract_actions_js_url(checkout_html, shop_url)
+                if old_action:
+                    js_urls = [old_action]
+                else:
+                    raise Exception("could not find actions JS URL")
+
+            proposal_id = submit_id = ""
+            poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+
+            for js_url in js_urls:
+                try:
+                    js_body = fetch_actions_js(client, js_url, shop_url)
+                    pid = extract_proposal_id(js_body)
+                    sid = extract_submit_for_completion_id(js_body)
+                    if pid and sid:
+                        proposal_id = pid
+                        submit_id = sid
+                        break
+                except Exception:
+                    continue
+
+            if not proposal_id or not submit_id:
+                for js_url in js_urls:
+                    try:
+                        js_body = fetch_actions_js(client, js_url, shop_url)
+                        all_hex = re.findall(r'"([a-f0-9]{64})"', js_body)
+                        if len(all_hex) >= 2:
+                            proposal_id = proposal_id or all_hex[0]
+                            submit_id = submit_id or all_hex[1]
+                            break
+                    except Exception:
+                        continue
+
             if not proposal_id or not submit_id:
                 raise Exception("missing Proposal or Submit ID")
-            poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+
         except Exception as e:
+            result.status = CheckStatus.ERROR
             result.retryable = True
             result.error = Exception(f"Step 3 failed: {e}")
             return result
@@ -1867,7 +1907,6 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
                         pass
                 time.sleep(min(delay, 300) / 1000.0)
 
-            # ✅ خلصت المحاولات ولسه ProcessingReceipt → صنّفه كـ ERROR (retry)
             result.status      = CheckStatus.ERROR
             result.status_code = "PROCESSING"
             result.error       = Exception("PROCESSING")
